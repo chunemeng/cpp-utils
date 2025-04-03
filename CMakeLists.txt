@@ -10,8 +10,10 @@ message(STATUS "C++ compiler version: ${CMAKE_CXX_COMPILER_VERSION}")
 
 
 OPTION(ENABLE_TEST "Enable test" ON)
-OPTION(ENABLE_DEBUG "Enable debug" ON)
-OPTION(ENABLE_DEBUG_INFO "Enable debug info" ON)
+OPTION(ENABLE_BENCHMARK "Enable benchmark" ON)
+
+OPTION(ENABLE_DEBUG "Enable debug" OFF)
+OPTION(ENABLE_DEBUG_INFO "Enable debug info" OFF)
 # Sanitizers(enable once at a time)
 OPTION(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 OPTION(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
@@ -19,8 +21,8 @@ OPTION(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 
 if (ENABLE_ASAN)
     message(STATUS "AddressSanitizer enabled")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -fsanitize=leak")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address -fsanitize=leak")
 endif ()
 
 if (ENABLE_UBSAN)
@@ -52,7 +54,20 @@ if (ENABLE_DEBUG_INFO)
     SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
 endif ()
 
-include_directories("${CMAKE_SOURCE_DIR}/include")
+include_directories(include)
+
+if (ENABLE_TEST)
+    message(STATUS "Test enabled")
+    include(extern/gtest/googletest.cmake)
+    add_subdirectory(test)
+    enable_testing()
+endif ()
+
+if (ENABLE_BENCHMARK)
+    message(STATUS "Benchmark enabled")
+    include(extern/benchmark/benchmark.cmake)
+    add_subdirectory(bench)
+endif ()
 
 
 
