@@ -372,8 +372,8 @@ namespace alp_utils {
 
     void avl_rotate_left(avl_tree_node_base *x,
                          avl_tree_node_base *p) noexcept {
-        [[assume(x != nullptr)]];
-        [[assume(p != nullptr)]];
+//        [[assume(x != nullptr)]];
+//        [[assume(p != nullptr)]];
         p->right_ = x->left_;
         x->left_ = p;
 
@@ -1576,7 +1576,6 @@ namespace alp_utils {
     template<typename K_, typename Tp_, typename Compare_ = std::less<K_>,
             typename Alloc_ = std::allocator<std::pair<const K_, Tp_> > >
     class avl_map {
-    public:
     public:
         using key_type = K_;
         using mapped_type = Tp_;

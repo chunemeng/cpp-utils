@@ -45,7 +45,7 @@ TEST(AvlMapTest, RandomAdd) {
     std::vector<std::pair<int, int>> vec2(vec.begin(), vec.end());
     std::shuffle(vec2.begin(), vec2.end(), std::mt19937{std::random_device{}()});
 
-    alp::avl_map<int, int> avl_map;
+    avl_map<int, int> avl_map;
     int i = 0;
     for (auto it: vec2) {
         avl_map.emplace(it.first, it.second);
@@ -75,7 +75,7 @@ TEST(AvlMapTest, RandomAdd) {
 
 TEST(AvlMapTest, RandomErase) {
     std::map<int, int> vec;
-    alp::avl_map<int, int> avl_map;
+    avl_map<int, int> avl_map;
 
     for (int i = 0; i < 100000; i++) {
         int a = i;
@@ -106,7 +106,7 @@ TEST(AvlMapTest, RandomErase) {
 
 TEST(AvlMapTest, RandomExtract) {
     std::map<int, int> vec;
-    alp::avl_map<int, int> avl_map;
+    avl_map<int, int> avl_map;
 
     for (int i = 0; i < 100000; i++) {
         int a = i;
@@ -130,7 +130,7 @@ TEST(AvlMapTest, RandomExtract) {
 }
 
 TEST(AvlMapTest, EraseEmpty) {
-    alp::avl_map<int, int> avl_map;
+    avl_map<int, int> avl_map;
     avl_map.erase(1);
     avl_map.size();
     EXPECT_EQ(avl_map.size(), 0);
@@ -139,7 +139,7 @@ TEST(AvlMapTest, EraseEmpty) {
 }
 
 TEST(AvlMapTest, EraseRoot) {
-    alp::avl_map<int, int> avl_map;
+    avl_map<int, int> avl_map;
     avl_map.emplace(1, 1);
     avl_map.erase(1);
     EXPECT_EQ(avl_map.size(), 0);
@@ -251,6 +251,5 @@ void benchmark() {
 
 TEST(AvlMapTest, ThroughPut) {
     benchmark<std::map>();
-    benchmark<alp::avl_map>();
-
+    benchmark<avl_map>();
 }

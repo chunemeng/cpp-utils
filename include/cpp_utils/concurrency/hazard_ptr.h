@@ -3,15 +3,17 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <thread>
 #include <unordered_set>
-#include <list>
-#include <iostream>
 
 namespace alp_utils::hazp {
     namespace detail {
+        // NOTE: m_next_ is used in reclaimer free_list, and local_holder free_list
+        //       next_ is used in reclaimer holder_storage
         struct holder {
             void set_next(holder *next) noexcept {
                 m_next_.store(next, std::memory_order_relaxed);
@@ -217,7 +219,6 @@ namespace alp_utils::hazp {
         template<typename Node>
         struct concurrent_forward_list {
             std::atomic<Node *> head_{nullptr};
-            std::atomic<uint32_t> size_{0};
 
             bool empty() const noexcept {
                 return head_.load(std::memory_order_acquire) == nullptr;
@@ -233,24 +234,18 @@ namespace alp_utils::hazp {
                         std::memory_order_acq_rel,
                         std::memory_order_relaxed
                 ));
-                size_.fetch_add(1, std::memory_order_relaxed);
             }
 
-            uint32_t size() const noexcept {
-                return size_.load(std::memory_order_acquire);
-            }
-
-            Node *pop(Node *(Node::*next)() const) noexcept {
+            Node *pop(Node *(Node::*next_fun)() const) noexcept {
                 Node *expected_head = head_.load(std::memory_order_acquire);
                 while (expected_head != nullptr) {
-                    Node *next = expected_head->next();
+                    Node *next = (expected_head->*next_fun)();
                     if (head_.compare_exchange_weak(
                             expected_head,
                             next,
                             std::memory_order_acq_rel,
                             std::memory_order_relaxed
                     )) {
-                        size_.fetch_sub(1, std::memory_order_relaxed);
                         return expected_head;
                     }
                 }
@@ -258,6 +253,76 @@ namespace alp_utils::hazp {
             }
         };
 
+        struct read_write_lock {
+        private:
+            static constexpr uint32_t WRITE_LOCK_MASK = 0x80000000;
+            std::atomic<uint32_t> state{0};
+
+        public:
+            bool try_lock_shared() {
+                uint32_t expected = state.load(std::memory_order_relaxed);
+                if ((expected & WRITE_LOCK_MASK) == 0) {
+                    uint32_t const desired = expected + 1;
+                    return state.compare_exchange_strong(
+                            expected, desired,
+                            std::memory_order_acquire,
+                            std::memory_order_relaxed
+                    );
+                }
+                return false;
+            }
+
+            bool try_lock() {
+                uint32_t expected = 0;
+                return state.compare_exchange_strong(
+                        expected, WRITE_LOCK_MASK,
+                        std::memory_order_acquire,
+                        std::memory_order_relaxed
+                );
+            }
+
+            void lock_shared() {
+                uint32_t expected = state.load(std::memory_order_relaxed);
+                while (true) {
+                    if ((expected & WRITE_LOCK_MASK) == 0) {
+                        uint32_t const desired = expected + 1;
+                        if (state.compare_exchange_weak(
+                                expected, desired,
+                                std::memory_order_acquire,
+                                std::memory_order_relaxed
+                        )) {
+                            break;
+                        }
+                    } else {
+                        std::this_thread::yield();
+                        expected = state.load(std::memory_order_relaxed);
+                    }
+                }
+            }
+
+            void unlock_shared() {
+                if (state.fetch_sub(1, std::memory_order_release) == 1) {
+                    state.notify_all();
+                }
+            }
+
+            void lock() {
+                uint32_t expected = 0;
+                while (!state.compare_exchange_weak(
+                        expected, WRITE_LOCK_MASK,
+                        std::memory_order_acquire,
+                        std::memory_order_relaxed
+                )) {
+                    state.wait(0, std::memory_order_relaxed);
+                    expected = 0;
+                }
+            }
+
+            void unlock() {
+                state.store(0, std::memory_order_release);
+                state.notify_all();
+            }
+        };
     } // namespace detail
 
     class hazard_ptr {
@@ -274,13 +339,7 @@ namespace alp_utils::hazp {
             other.holder_ = nullptr;
         }
 
-        hazard_ptr &operator=(hazard_ptr &&other) noexcept {
-            if (this != &other) {
-                holder_ = other.holder_;
-                other.holder_ = nullptr;
-            }
-            return *this;
-        }
+        hazard_ptr &operator=(hazard_ptr &&other) noexcept;
 
         ~hazard_ptr();
 
@@ -321,7 +380,6 @@ namespace alp_utils::hazp {
 
         ~reclaimer() {
             reclaim_all_objects();
-            std::cout << "reclaimer destructor" << s << std::endl;
         }
 
         // This class is not copyable
@@ -433,7 +491,35 @@ namespace alp_utils::hazp {
             retire_node *next_{nullptr};
         };
 
+        struct free_list : public detail::concurrent_forward_list<detail::holder> {
+            free_list() = default;
+
+            free_list(const free_list &) = delete;
+
+            free_list &operator=(const free_list &) = delete;
+
+            free_list(free_list &&) = delete;
+
+            free_list &operator=(free_list &&) = delete;
+
+            void push(detail::holder *holder) {
+                concurrent_forward_list::push(holder, &detail::holder::set_barrier_next);
+            }
+
+            detail::holder *pop() {
+                return concurrent_forward_list::pop(&detail::holder::barrier_next);
+            }
+
+            detail::holder *pop_all() {
+                detail::holder *newval = nullptr;
+                return head_.exchange(newval, std::memory_order_acq_rel);
+            }
+        };
+
         struct holder_list : public detail::concurrent_forward_list<detail::holder> {
+            std::atomic<uint32_t> size_{0};
+            mutable detail::read_write_lock rw_lock_{};
+
             holder_list() = default;
 
             holder_list(const holder_list &) = delete;
@@ -460,28 +546,63 @@ namespace alp_utils::hazp {
                 delete head_.load();
             }
 
+            uint32_t size() const {
+                return size_.load(std::memory_order_relaxed);
+            }
+
             void push(detail::holder *holder) {
+                rw_lock_.lock_shared();
+                size_.fetch_add(1, std::memory_order_relaxed);
                 concurrent_forward_list::push(holder, &detail::holder::set_main_next);
-            }
-        };
-
-        struct free_list : public detail::concurrent_forward_list<detail::holder> {
-            free_list() = default;
-
-            free_list(const free_list &) = delete;
-
-            free_list &operator=(const free_list &) = delete;
-
-            free_list(free_list &&) = delete;
-
-            free_list &operator=(free_list &&) = delete;
-
-            void push(detail::holder *holder) {
-                concurrent_forward_list::push(holder, &detail::holder::set_barrier_next);
+                rw_lock_.unlock_shared();
             }
 
-            detail::holder *pop() {
-                return concurrent_forward_list::pop(&detail::holder::barrier_next);
+            void compact(detail::holder *compacted_list) {
+                std::unordered_set<detail::holder *> set;
+                while (compacted_list != nullptr) {
+                    set.insert(compacted_list);
+                    compacted_list = compacted_list->next();
+                }
+
+                rw_lock_.lock();
+
+                auto head = head_.load(std::memory_order_acquire);
+                uint32_t size = 0;
+                detail::holder *new_head = nullptr;
+
+                while (head != nullptr) {
+                    if (!set.contains(head)) {
+                        new_head = head;
+                        size++;
+                        head = head->main_next();
+                        break;
+                    } else {
+                        head = head->main_next();
+                    }
+                }
+
+                auto tmp = new_head;
+
+                while (head != nullptr) {
+                    if (!set.contains(head)) {
+                        tmp->set_main_next(head);
+                        tmp = head;
+                        size++;
+                    }
+                    head = head->main_next();
+                }
+
+                if (tmp != nullptr) {
+                    tmp->set_main_next(nullptr);
+                }
+
+                head_.store(new_head, std::memory_order_release);
+                size_.store(size, std::memory_order_relaxed);
+                rw_lock_.unlock();
+
+                for (auto &node: set) {
+                    delete node;
+                }
             }
         };
 
@@ -492,7 +613,9 @@ namespace alp_utils::hazp {
 
         static constexpr uint32_t kShardMask = kNumShards - 1;
 
-        static constexpr int kReclaimThreshold = 100;
+        static constexpr int kReclaimThreshold = 1000;
+
+        static constexpr uint64_t kSyncTimePeriod{2000000000}; // nanoseconds
 
         friend class hazard_ptr;
 
@@ -504,6 +627,11 @@ namespace alp_utils::hazp {
 
         static void evict_hazard_ptr() {
             get_instance().evict_hazard_ptr();
+        }
+
+        void delete_hazard_ptr() {
+            auto list = free_list_.pop_all();
+            holder_list_.compact(list);
         }
 
         void reuse(detail::holder *holder) {
@@ -520,8 +648,6 @@ namespace alp_utils::hazp {
         template<typename T, typename D = std::default_delete<T>>
         void retire(T *ptr, D &&deleter = {}) {
             struct retire_node_impl : public retire_node {
-                explicit retire_node_impl(T *ptr, D d) : ptr_(ptr, std::forward<D>(d)) {}
-
                 explicit retire_node_impl(std::unique_ptr<T, D> ptr) : ptr_(std::move(ptr)) {}
 
                 const void *raw_ptr() const override { return ptr_.get(); }
@@ -551,12 +677,9 @@ namespace alp_utils::hazp {
             return holder;
         }
 
-        uint32_t s = 0;
-
         detail::holder *make_holder() {
             if (!free_list_.empty()) [[unlikely]] {
                 auto holder = free_list_.pop();
-                s++;
                 return holder ? holder : make_new_holder();
             }
             return make_new_holder();
@@ -571,10 +694,29 @@ namespace alp_utils::hazp {
             }
         }
 
+        int check_due_time() {
+            uint64_t const time = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+            auto due = load_due_time();
+            if (time < due || !cas_due_time(due, time + kSyncTimePeriod)) {
+                return 0;
+            }
+            int const rcount = exchange_count(0);
+            if (rcount < 0) {
+                add_count(rcount);
+                return 0;
+            }
+            return rcount;
+        }
+
         void check_threshold_and_reclaim() {
-            int const rcount = check_count_threshold();
+            int rcount = check_count_threshold();
             if (rcount == 0) {
-                return;
+                rcount = check_due_time();
+                if (rcount == 0) {
+                    return;
+                }
             }
 
             inc_num_bulk_reclaims();
@@ -686,7 +828,9 @@ namespace alp_utils::hazp {
         }
 
         [[nodiscard]] std::unordered_set<const void *> load_hazptr_vals() const {
+            holder_list_.rw_lock_.lock_shared();
             auto head = holder_list_.head_.load(std::memory_order_acquire);
+            // std::unordered_set is slower than what I can imagine :(
             std::unordered_set<const void *> protected_ptrs;
 
             protected_ptrs.reserve(holder_list_.size());
@@ -702,6 +846,7 @@ namespace alp_utils::hazp {
                 protected_ptrs.insert(reinterpret_cast<const void *>(ptr));
                 head = head->next_.load(std::memory_order_acquire);
             }
+            holder_list_.rw_lock_.unlock_shared();
 
             return protected_ptrs;
         }
@@ -710,10 +855,27 @@ namespace alp_utils::hazp {
 
         int load_count() { return count_.load(std::memory_order_acquire); }
 
+        int exchange_count(int rcount) { return count_.exchange(rcount, std::memory_order_acq_rel); }
+
         bool cas_count(int &expected, int desired) {
             return count_.compare_exchange_weak(
                     expected, desired, std::memory_order_acq_rel, std::memory_order_relaxed);
         }
+
+        uint64_t load_due_time() { return due_time_.load(std::memory_order_acquire); }
+
+        void set_due_time() {
+            uint64_t time = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+            due_time_.store(time + kSyncTimePeriod, std::memory_order_release);
+        }
+
+        bool cas_due_time(uint64_t &expected, uint64_t newval) {
+            return due_time_.compare_exchange_strong(
+                    expected, newval, std::memory_order_acq_rel, std::memory_order_relaxed);
+        }
+
 
         void push_list(retire_node *ptr) {
             // NOTE: 4 bit may already skip the empty bits.
@@ -749,11 +911,29 @@ namespace alp_utils::hazp {
         free_list free_list_{};
 
         std::atomic<int> count_{0};
+        std::atomic<uint64_t> due_time_{0};
+
 
         std::array<retired_list, kNumShards> retired_list_{};
 
         std::atomic<uint16_t> num_bulk_reclaims_{0};
     };
+
+    hazard_ptr &hazard_ptr::operator=(hazard_ptr &&other) noexcept {
+        if (this == &other) [[unlikely]] {
+            return *this;
+        }
+
+        if (holder_ != nullptr) [[unlikely]] {
+            unmark();
+            reclaimer::get_instance().reuse(holder_);
+            holder_ = nullptr;
+        }
+
+        std::swap(holder_, other.holder_);
+
+        return *this;
+    }
 
     hazard_ptr::~hazard_ptr() {
         if (holder_ == nullptr) [[unlikely]] {
@@ -791,7 +971,7 @@ namespace alp_utils::hazp {
     }
 
     static inline void delete_hazard_ptr() {
-        return;
+        reclaimer::instance().delete_hazard_ptr();
     }
 
 
@@ -800,8 +980,7 @@ namespace alp_utils::hazp {
         hazptr_array<size> hazptrs_;
 
     public:
-        hazard_local() {
-            hazptrs_ = reclaimer::make_hazard_ptr<size>();
+        hazard_local() : hazptrs_(reclaimer::make_hazard_ptr<size>()) {
         }
 
         ~hazard_local() {
