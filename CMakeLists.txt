@@ -41,6 +41,8 @@ if (UNIX)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
 endif ()
 
+SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-interference-size")
+
 if (ENABLE_DEBUG)
     message(STATUS "Debug mode enabled")
     SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -w")
