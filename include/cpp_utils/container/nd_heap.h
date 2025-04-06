@@ -107,18 +107,35 @@ namespace alp_utils {
         void sink(size_t index) {
             const size_t size = data_.size();
             auto current = std::move(data_[index]);
-            while (true) {
-                size_t extreme_child = 0;
-                if constexpr (is_power_of_two && d <= 8) {
-                    extreme_child = find_extreme_child_impl(index, size, std::make_index_sequence<d - 1>());
+            if constexpr (is_power_of_two && d <= 8) {
+                while (true) {
+                    size_t extreme_child = find_extreme_child_impl(index, size, std::make_index_sequence<d - 1>());
                     if (extreme_child >= size || !cmp_(current, data_[extreme_child])) break;
                     data_[index] = std::move(data_[extreme_child]);
                     index = extreme_child;
-                } else {
+                }
+            } else {
+                const size_t min_child = child_index(size, 0);
+
+                while (index < min_child) {
+                    size_t extreme_child = min_child;
+                    for (uint16_t k = 0; k < d; ++k) {
+                        size_t current_child = child_index(index, k);
+                        if (current_child >= size) break;
+                        extreme_child = cmp_(data_[extreme_child], data_[current_child])
+                                        ? current_child : extreme_child;
+                    }
+
+                    if (!cmp_(current, data_[extreme_child])) break;
+                    data_[index] = std::move(data_[extreme_child]);
+                    index = extreme_child;
+                }
+
+                while (true) {
                     size_t first_child = child_index(index, 0);
                     if (first_child >= size) break;
 
-                    extreme_child = first_child;
+                    size_t extreme_child = first_child;
                     for (uint16_t k = 1; k < d; ++k) {
                         size_t current_child = child_index(index, k);
                         if (current_child >= size) break;
@@ -131,6 +148,7 @@ namespace alp_utils {
                     index = extreme_child;
                 }
             }
+
             data_[index] = std::move(current);
         }
 
